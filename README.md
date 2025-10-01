@@ -22,7 +22,7 @@ G|Flows, or Greek Flows, provides 15-minute updates for the SPX, NDX, and RUT in
 
 ## Setup
 
-This application is compatible with Python versions **>=3.10**
+This application is compatible with Python versions **>=3.11**
 
 ### Virtual Environment (Recommended)
 

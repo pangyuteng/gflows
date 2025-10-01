@@ -5,6 +5,7 @@ import orjson
 import modules.stats as stats
 from yfinance import Ticker
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 from zoneinfo import ZoneInfo
 from dateparser.date import DateDataParser
 from warnings import simplefilter
@@ -44,13 +45,51 @@ def is_third_friday(date, tz):
     return (found[0], result) if found[0] else (found[1], result)
 
 
+@cached(cache=TTLCache(maxsize=16, ttl=60 * 60 * 4))  # in-memory cache for 4 hrs
+def get_next_monthly_opex(first_expiry, tz, max_months_ahead=6):
+    """
+    Find the next monthly OPEX that hasn't expired yet.
+    Searches up to max_months_ahead months from first expiration.
+    """
+
+    # Generate candidate months starting from first_expiry month
+    base_date = first_expiry.replace(day=1)
+
+    for month_offset in range(max_months_ahead):
+        check_date = base_date + relativedelta(months=month_offset)
+        monthly_opex, _ = is_third_friday(check_date, tz)
+
+        if monthly_opex and first_expiry <= monthly_opex:
+            return monthly_opex
+
+    # Fallback: return the OPEX for the first expiry month even if expired
+    return is_third_friday(first_expiry, tz)[0]
+
+
 # check 10 yr treasury yield
 @cached(cache=TTLCache(maxsize=16, ttl=60 * 15))  # in-memory cache for 15 min
-def check_ten_yr(date):
+def check_ten_yr(date, max_attempts=3):
+    """
+    Fetch 10-year treasury yield with a maximum retry limit to prevent infinite recursion.
+
+    Args:
+        date: The target date to fetch data for
+        max_attempts: Maximum number of retry attempts (default: 3)
+
+    Returns:
+        10-year treasury yield as a decimal
+
+    Raises:
+        RuntimeError: If unable to fetch treasury data after max_attempts
+    """
     data = Ticker("^TNX").history(start=date - timedelta(days=5), end=date)
     if data.empty:
-        # no data for the date range so look back further
-        return check_ten_yr(date - timedelta(days=2))
+        # Check if we've exceeded the maximum attempts
+        if max_attempts <= 1:
+            raise RuntimeError(f"Unable to fetch 10Y treasury data after 3 attempts")
+
+        # Recursively look back further with decremented attempts
+        return check_ten_yr(date - timedelta(days=2), max_attempts - 1)
     else:
         # most recent date
         return data.tail(1)["Close"].item() / 100
@@ -120,13 +159,18 @@ def calc_exposures(
     ticker,
     expir,
     first_expiry,
+    next_monthly_opex,
     this_monthly_opex,
     spot_price,
     today_ddt,
     today_ddt_string,
 ):
     dividend_yield = 0.0  # assume 0
-    yield_10yr = check_ten_yr(today_ddt)
+    try:
+        yield_10yr = check_ten_yr(today_ddt)
+    except RuntimeError as e:
+        print(f"Warning: {e}. Using fallback value of 0%")
+        yield_10yr = 0.0  # fallback to 0%
 
     monthly_options_dates = [first_expiry, this_monthly_opex]
 
@@ -436,7 +480,7 @@ def calc_exposures(
     totalcharm["all"] = (call_charm_ex.sum(axis=1) - put_charm_ex.sum(axis=1)) / 10**9
 
     expirs_next_expiry = expirations == first_expiry
-    expirs_up_to_monthly_opex = expirations <= this_monthly_opex
+    expirs_up_to_monthly_opex = expirations <= next_monthly_opex
     if expir != "0dte":
         # exposure for next expiry
         totaldelta["ex_next"] = (
@@ -567,6 +611,7 @@ def get_options_data_json(ticker, expir, tz):
         except IndexError:
             print("next date unavailable. using expired date")
 
+    next_monthly_opex = get_next_monthly_opex(first_expiry, tz)
     this_monthly_opex, calendar_range = is_third_friday(first_expiry, tz)
 
     if expir == "monthly":
@@ -584,6 +629,7 @@ def get_options_data_json(ticker, expir, tz):
         ticker,
         expir,
         first_expiry,
+        next_monthly_opex,
         this_monthly_opex,
         spot_price,
         today_ddt,
@@ -684,6 +730,7 @@ def get_options_data_csv(ticker, expir, tz):
             first_expiry = all_dates.iat[1]
         except IndexError:
             print("next date unavailable. using expired date")
+    next_monthly_opex = get_next_monthly_opex(first_expiry, tz)
     this_monthly_opex, calendar_range = is_third_friday(first_expiry, tz)
 
     busday_counts = np.busday_count(
@@ -711,6 +758,7 @@ def get_options_data_csv(ticker, expir, tz):
         ticker,
         expir,
         first_expiry,
+        next_monthly_opex,
         this_monthly_opex,
         spot_price,
         today_ddt,
