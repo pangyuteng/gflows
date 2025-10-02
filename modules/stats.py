@@ -38,7 +38,7 @@ def norm_cdf(x, mu, sigma):
 # T is time to expiration, r is risk-free rate, q is dividend yield
 @njit(
     UniTuple(float64[:, :], 3)(
-        float64[:, :], float64[:], float64[:], float64[:], float64, float64
+        float64[:, :], float64[:], float64[:], float64[:], float64[:], float64
     )
 )
 def calc_dp_cdf_pdf(S, K, vol, T, r, q):
@@ -98,7 +98,7 @@ def calc_vanna_ex(S, vol, T, q, OI, dp, pdf_dp):
         float64[:, :],
         float64[:],
         float64[:],
-        float64,
+        float64[:],
         float64,
         string,
         float64[:],

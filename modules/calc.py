@@ -2,6 +2,7 @@ import pandas as pd
 import exchange_calendars as xcals
 import numpy as np
 import orjson
+import requests
 import modules.stats as stats
 from yfinance import Ticker
 from datetime import datetime, timedelta
@@ -66,33 +67,179 @@ def get_next_monthly_opex(first_expiry, tz, max_months_ahead=6):
     return is_third_friday(first_expiry, tz)[0]
 
 
-# check 10 yr treasury yield
-@cached(cache=TTLCache(maxsize=16, ttl=60 * 15))  # in-memory cache for 15 min
-def check_ten_yr(date, max_attempts=3):
+@cached(cache=TTLCache(maxsize=16, ttl=60 * 60 * 4))  # in-memory cache for 4 hrs
+def fetch_treasury_yield_curve(target_date=None):
     """
-    Fetch 10-year treasury yield with a maximum retry limit to prevent infinite recursion.
+    Fetch treasury yield curve rates for multiple tenors.
+    Primary: FRED (Federal Reserve - exact maturities)
+    Fallback: yfinance (3mo, 5yr, 10yr)
+    Last resort: Neutral 3% centered upward-sloping curve
 
     Args:
-        date: The target date to fetch data for
-        max_attempts: Maximum number of retry attempts (default: 3)
+        target_date: Optional datetime object to fetch rates for a specific date.
+                    If None, fetches the most recent rates.
 
     Returns:
-        10-year treasury yield as a decimal
-
-    Raises:
-        RuntimeError: If unable to fetch treasury data after max_attempts
+        dict: Mapping of tenor names to yield rates (as decimals)
+        Keys: '1mo', '3mo', '6mo', '1yr', '2yr', '5yr', '10yr'
     """
-    data = Ticker("^TNX").history(start=date - timedelta(days=5), end=date)
-    if data.empty:
-        # Check if we've exceeded the maximum attempts
-        if max_attempts <= 1:
-            raise RuntimeError(f"Unable to fetch 10Y treasury data after 3 attempts")
 
-        # Recursively look back further with decremented attempts
-        return check_ten_yr(date - timedelta(days=2), max_attempts - 1)
+    # Primary: Try FRED first (official Federal Reserve data)
+    try:
+        series_ids = {
+            "1mo": "DGS1MO",
+            "3mo": "DGS3MO",
+            "6mo": "DGS6MO",
+            "1yr": "DGS1",
+            "2yr": "DGS2",
+            "5yr": "DGS5",
+            "10yr": "DGS10",
+        }
+
+        # Set date range
+        if target_date:
+            end_date = target_date + timedelta(days=1)
+            start_date = target_date - timedelta(days=7)
+        else:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=7)
+
+        rates = {}
+        base_url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+        for tenor, series_id in series_ids.items():
+            try:
+                params = {
+                    "id": series_id,
+                    "cosd": start_date.strftime("%Y-%m-%d"),
+                    "coed": end_date.strftime("%Y-%m-%d"),
+                }
+                response = requests.get(base_url, params=params, timeout=10)
+                response.raise_for_status()
+
+                lines = response.text.strip().split("\n")
+                if len(lines) >= 2:
+                    if target_date:
+                        target_str = target_date.strftime("%Y-%m-%d")
+                        # Try exact date match first
+                        for line in lines[1:]:
+                            parts = line.split(",")
+                            if (
+                                len(parts) == 2
+                                and parts[0] == target_str
+                                and parts[1] not in ["", ".", "NA"]
+                            ):
+                                rates[tenor] = float(parts[1]) / 100
+                                break
+                        # If no exact match, find closest previous date
+                        if tenor not in rates:
+                            for line in reversed(lines[1:]):
+                                parts = line.split(",")
+                                if (
+                                    len(parts) == 2
+                                    and parts[1] not in ["", ".", "NA"]
+                                    and parts[0] <= target_str
+                                ):
+                                    rates[tenor] = float(parts[1]) / 100
+                                    break
+                    else:
+                        # Get most recent rate
+                        for line in reversed(lines[1:]):
+                            parts = line.split(",")
+                            if len(parts) == 2 and parts[1] not in ["", ".", "NA"]:
+                                rates[tenor] = float(parts[1]) / 100
+                                break
+            except:
+                continue
+
+        if len(rates) >= 3:
+            return rates
+
+    except Exception as e:
+        print(f"FRED failed: {e}")
+
+    # Fallback: Try yfinance
+    try:
+        rates = {}
+        if target_date:
+            start_date = target_date - timedelta(days=5)
+            end_date = target_date + timedelta(days=1)
+        else:
+            start_date = None
+            end_date = None
+
+        # Fetch ^IRX (3mo), ^FVX (5yr), ^TNX (10yr)
+        for symbol, tenor in [("^IRX", "3mo"), ("^FVX", "5yr"), ("^TNX", "10yr")]:
+            try:
+                if start_date:
+                    data = Ticker(symbol).history(start=start_date, end=end_date)
+                else:
+                    data = Ticker(symbol).history(period="5d")
+                if not data.empty:
+                    rates[tenor] = data.tail(1)["Close"].item() / 100
+            except:
+                pass
+
+        if len(rates) >= 2:
+            return rates
+    except:
+        pass
+
+    # Last resort: Default (neutral upward-sloping curve)
+    # Based on ~3% mid-curve (reasonable across cycles)
+    return {
+        "1mo": 0.025,  # 2.5% - short-term
+        "3mo": 0.027,  # 2.7%
+        "6mo": 0.029,  # 2.9%
+        "1yr": 0.030,  # 3.0%
+        "2yr": 0.031,  # 3.1%
+        "5yr": 0.033,  # 3.3%
+        "10yr": 0.035,  # 3.5% - long-term
+    }
+
+
+def get_tenor_matched_rate(days_to_expiry, yield_curve):
+    """
+    Get the appropriate risk-free rate based on days to expiration.
+    Falls back to closest available tenor if exact match not found.
+
+    Args:
+        days_to_expiry: Number of days until option expiration
+        yield_curve: Dictionary of rates from fetch_treasury_yield_curve()
+
+    Returns:
+        Risk-free rate (as decimal) appropriate for the tenor
+    """
+    if not yield_curve:
+        return 0.030  # 3.0% default (neutral mid-curve rate)
+
+    # Define tenor preferences in order (primary, fallback1, fallback2, ...)
+    if days_to_expiry <= 30:
+        tenors = ["1mo", "3mo", "6mo", "1yr"]
+    elif days_to_expiry <= 90:
+        tenors = ["3mo", "1mo", "6mo", "1yr"]
+    elif days_to_expiry <= 180:
+        tenors = ["6mo", "3mo", "1yr", "2yr"]
+    elif days_to_expiry <= 365:
+        tenors = ["1yr", "6mo", "2yr", "5yr"]
+    elif days_to_expiry <= 730:
+        tenors = ["2yr", "1yr", "5yr", "10yr"]
+    elif days_to_expiry <= 1825:
+        tenors = ["5yr", "2yr", "10yr"]
     else:
-        # most recent date
-        return data.tail(1)["Close"].item() / 100
+        tenors = ["10yr", "5yr", "2yr"]
+
+    # Return first available tenor from preference list
+    for tenor in tenors:
+        if tenor in yield_curve:
+            return yield_curve[tenor]
+
+    # If none of the preferred tenors exist, return any available rate
+    if yield_curve:
+        return list(yield_curve.values())[0]
+
+    # Final fallback
+    return 0.030  # 3.0% neutral mid-curve rate
 
 
 def is_parsable(date):
@@ -104,7 +251,7 @@ def is_parsable(date):
 
 
 def format_data(data, today_ddt, tzinfo):
-    keys_to_keep = ["option", "iv", "open_interest", "delta", "gamma"]
+    keys_to_keep = ["option", "iv", "open_interest", "volume", "delta", "gamma"]
     data = pd.DataFrame([{k: d[k] for k in keys_to_keep if k in d} for d in data])
     data = pd.concat(
         [
@@ -113,6 +260,7 @@ def format_data(data, today_ddt, tzinfo):
                     "option": "calls",
                     "iv": "call_iv",
                     "open_interest": "call_open_int",
+                    "volume": "call_vol",
                     "delta": "call_delta",
                     "gamma": "call_gamma",
                 }
@@ -124,6 +272,7 @@ def format_data(data, today_ddt, tzinfo):
                     "option": "puts",
                     "iv": "put_iv",
                     "open_interest": "put_open_int",
+                    "volume": "put_vol",
                     "delta": "put_delta",
                     "gamma": "put_gamma",
                 }
@@ -166,21 +315,53 @@ def calc_exposures(
     today_ddt_string,
 ):
     dividend_yield = 0.0  # assume 0
-    try:
-        yield_10yr = check_ten_yr(today_ddt)
-    except RuntimeError as e:
-        print(f"Warning: {e}. Using fallback value of 0%")
-        yield_10yr = 0.0  # fallback to 0%
+
+    # Fetch treasury yield curve for tenor-matching
+    # This will always return valid rates (uses fallback chain: FRED → yfinance → default curve)
+    yield_curve = fetch_treasury_yield_curve()
+
+    # Calculate days to expiration
+    expirations = option_data["expiration_date"]
+    days_to_expiry = (expirations - today_ddt).dt.days.to_numpy()
+
+    # Get tenor-matched risk-free rates for each option
+    risk_free_rates = np.array(
+        [get_tenor_matched_rate(days, yield_curve) for days in days_to_expiry]
+    )
 
     monthly_options_dates = [first_expiry, this_monthly_opex]
 
     strike_prices = option_data["strike_price"].to_numpy()
-    expirations = option_data["expiration_date"].to_numpy()
     time_till_exp = option_data["time_till_exp"].to_numpy()
     opt_call_ivs = option_data["call_iv"].to_numpy()
     opt_put_ivs = option_data["put_iv"].to_numpy()
-    call_open_interest = option_data["call_open_int"].to_numpy()
-    put_open_interest = option_data["put_open_int"].to_numpy()
+
+    # IMPORTANT: For 0DTE and 1DTE options, use VOLUME instead of OPEN INTEREST
+    #
+    # Reasoning:
+    # - Day -1 EOD volume represents positioning going into expiration day
+    # - Day 0 OI often doesn't reflect overnight positioning
+    # - Volume gives more accurate picture of exposure for very short-dated options
+    #
+    # For longer-dated options (2+ DTE), we use standard open interest.
+    is_short_dte = days_to_expiry <= 1
+
+    # Use volume for 0DTE/1DTE if available, otherwise fall back to OI
+    if "call_vol" in option_data.columns:
+        call_open_interest = np.where(
+            is_short_dte,
+            option_data["call_vol"].fillna(option_data["call_open_int"]).to_numpy(),
+            option_data["call_open_int"].to_numpy(),
+        )
+        put_open_interest = np.where(
+            is_short_dte,
+            option_data["put_vol"].fillna(option_data["put_open_int"]).to_numpy(),
+            option_data["put_open_int"].to_numpy(),
+        )
+    else:
+        # Fallback: use open interest for all (backwards compatibility)
+        call_open_interest = option_data["call_open_int"].to_numpy()
+        put_open_interest = option_data["put_open_int"].to_numpy()
 
     nonzero_call_cond = (time_till_exp > 0) & (opt_call_ivs > 0)
     nonzero_put_cond = (time_till_exp > 0) & (opt_put_ivs > 0)
@@ -191,7 +372,7 @@ def calc_exposures(
         strike_prices,
         opt_call_ivs,
         time_till_exp,
-        yield_10yr,
+        risk_free_rates,  # Use tenor-matched rates
         dividend_yield,
     )
     put_dp, put_cdf_dp, put_pdf_dp = stats.calc_dp_cdf_pdf(
@@ -199,7 +380,7 @@ def calc_exposures(
         strike_prices,
         opt_put_ivs,
         time_till_exp,
-        yield_10yr,
+        risk_free_rates,  # Use tenor-matched rates
         dividend_yield,
     )
 
@@ -258,7 +439,7 @@ def calc_exposures(
             np_spot_price,
             opt_call_ivs,
             time_till_exp,
-            yield_10yr,
+            risk_free_rates,  # Use tenor-matched rates
             dividend_yield,
             "call",
             call_open_interest,
@@ -274,7 +455,7 @@ def calc_exposures(
             np_spot_price,
             opt_put_ivs,
             time_till_exp,
-            yield_10yr,
+            risk_free_rates,  # Use tenor-matched rates
             dividend_yield,
             "put",
             put_open_interest,
@@ -352,7 +533,7 @@ def calc_exposures(
         strike_prices,
         opt_call_ivs,
         time_till_exp,
-        yield_10yr,
+        risk_free_rates,  # Use tenor-matched rates
         dividend_yield,
     )
     put_dp, put_cdf_dp, put_pdf_dp = stats.calc_dp_cdf_pdf(
@@ -360,7 +541,7 @@ def calc_exposures(
         strike_prices,
         opt_put_ivs,
         time_till_exp,
-        yield_10yr,
+        risk_free_rates,  # Use tenor-matched rates
         dividend_yield,
     )
     call_delta_ex = np.where(
@@ -443,7 +624,7 @@ def calc_exposures(
             levels,
             opt_call_ivs,
             time_till_exp,
-            yield_10yr,
+            risk_free_rates,  # Use tenor-matched rates
             dividend_yield,
             "call",
             call_open_interest,
@@ -459,7 +640,7 @@ def calc_exposures(
             levels,
             opt_put_ivs,
             time_till_exp,
-            yield_10yr,
+            risk_free_rates,  # Use tenor-matched rates
             dividend_yield,
             "put",
             put_open_interest,
@@ -680,12 +861,10 @@ def get_options_data_csv(ticker, expir, tz):
                     "call_net",
                     "call_bid",
                     "call_ask",
-                    "call_vol",
                     "put_last_sale",
                     "put_net",
                     "put_bid",
                     "put_ask",
-                    "put_vol",
                 ],
             )
     except:  # handle error if data unavailable
